@@ -1,0 +1,794 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE nta PUBLIC '-//Uppaal Team//DTD Flat System 1.1//EN' 'http://www.it.uu.se/research/group/darts/uppaal/flat-1_2.dtd'>
+<nta>
+	<declaration>/*
+Tento program je sucastou projektu bakalarskej prace. 
+Tema: Modelování a analýza vlivu ABS na chování vozidla	
+Autor: Dominik Holec (xholec07)
+Veduci: Ing. Josef Strnadel, Ph.D.
+Skola: Fakulta Informacnych Technologii, Vysoke Uceni Technicke v Brne
+Datum vypracovania: Skolsky rok 2017-2018, posledne upravy 7.5.2018
+
+Strucny popis: Program sa zameriava na simulaciu brzdnej drahy vozidla. Model je vytvoreny a funguje pri pouziti niektorych konstantnych parametrov. Projekt sa pokusa 
+byt realny a simulovat realne chovanie vozidla na zaklade fyzikalnych zakonov a empirickej aproximacie fyzikalnych dejov. 
+
+Obmedzenia: -Projekt sa po nudzovom brzdeni nevracia do povodnych stavov a simulacie je teda treba opakovat viacnasobne, nie v jednom behu. 
+    -V projekte je implicitne nastavena uz povodna rychlost vozidla nenulova. Projekt podporuje moznost startu vozidla od nuly, v takomto pripade je vsak potrebne predlzit 
+        cas simulacie, aby sa vozidlo dostalo na ,,rozumnu" rychlost pred brzdovym manevrom. Dovodom tohto obmedzenia je lepsia citatelnost grafov a vacsi doraz na priebeh 
+        funkcie brzdenia.
+
+*/
+
+//Channely sluziace na synchronizaciu/komunikaciu medzi jednotlivymi automatmi
+broadcast chan start; //sluzi ako rozkaz vodica riadiacej jednotke o nastartovani motora
+broadcast chan stop; //sluzi ako rozkaz vodica riadiacej jednotke o vypnuti motora
+broadcast chan engine_start; //signal na nastartovanie motoru od riadiacej jednotky
+broadcast chan engine_stop; //signal na vypnutie motora od riadiacej jednotky
+broadcast chan obstacle; //signal vsetkym zucastnenym, ze je na ceste prekazka vyzadujuca okamzite zastavenie
+
+/*Premenne mozu nadobudat hodnoty 0-100 (0, 10, 20, 30 ... 100) urcujuc, ci sofer mieni auto zrychlit alebo spomalit. 
+Na zaklade ich intenzity sa pocita zrychlenie v dany moment a auto upravuje svoju rychlost.
+V pripade prekazky na ceste a nudzoveho brzdenia stav zosliapnutia brzdoveho pedala naplno indikuju hodnoty p_brake = 150 a p_throttle = 0 */
+double p_throttle; //premenna zaznamenajuca silu stacenia plynoveho pedalu
+double p_brake; //premenna zaznamenajuca silu stlacenia brzdoveho pedalu
+
+//Casove premenne pouzite v modeli, v miere 1/10 sekundy
+clock t; 
+clock x; //hodiny pouzite na vyskyt udalosti nudzoveho brzdenia
+clock y;
+clock reaction; //popisuje reakciu sofera na nebezpecenstvo
+
+//Konstanty popisujuce testovacie vozidlo a podmienky
+const double d = 0.51915; //Odmerany a vypocitany priemer pneumatiky 205/55 R16 na aute Fiat Croma 2006r, v metroch [m]
+const double R = d/2.0; //polomer kolesa v metroch [m]
+const double m = 1600.0; //hmotnost vozidla [kg]
+const double g = 9.81; //gravitacne zrychlenie [m/s^2]
+const double Fn = m * g; //Tiazova sila [N]
+const double ro = 1.25; //[kg*m^-3] merna hmotnost vzduchu
+const double B = 1.513; //rozchod prednych kolies [m] Fiat Croma
+const double H = 1.597; //vyska vozidla [m] Fiat Croma
+const double S = B * H; //celna plocha vozidla [m]
+const double C = 0.29; //koeficient odporu udavany vyrobcom [] - bezrozmerna velicina
+
+//Konstanty popisujuce mozne nastavenie modelu
+const int DRY = 1;
+const int SNOWY = 2;
+const int RANDOM = 11;
+const int ZERO = 12;
+const int ASSIGNED = 13;
+const double TOWNS_SPEED = 50/3.6;
+const double OUTSIDE_TOWNS_SPEED = 90/3.6;
+const double MOTORWAYS_SPEED = 130/3.6;
+const double ASSIGNED_SPEED = 100.0 / 3.6;
+const int MAX_BRAKE = 100;
+const int MAX_THROTTLE = 100;
+//mozne menit minimalny a maximalny cas, kedy sa ma stat nahodne udalost nudzoveho brzdenia. Cislo vyjadruje casovy udaj v desatinach sekundy
+const int OBSTACLE_TIME_MIN = 5; 
+const int OBSTACLE_TIME_MAX = 10;
+
+//Nastavenie modelu 
+int road_condition = DRY;
+bool ABS_allowed = true; 
+int beginning = ASSIGNED;
+
+//Fyzikalne premenne 
+double Fb; //Brzdna sila, neskor pocitana ako sucin koeficientu trenia s tlakovou silou Fb = friction_coeff * Fn; [N]
+double omega_v; //omega_v referencna rychlost vozidla vyjadrena v radianoch za sekundu
+double slip; //Bezrozmerna jednotka udavajuca sklz. Nadobuda hodnoty 0-1. Slip 0 = ziadny sklz (volne sa odvalujuce koleso), slip 1 = maximalny sklz (zablokovane koleso)
+double friction_coeff; //Koeficient trenia, ktory sa odvija od hodnoty sklzu. Dalej zavisi na stave vozovky. 
+double omega_w; //omega_w uhlova rychlost kolesa [rad/s]
+double a; //zrychlenie [m/s^2]
+double v = 0.0; //rychlost [m/s]
+double Ww; //uhlova rychlost pouzita vo vnutri funkcie [rad/s]
+double Ov; //vzdusny odpor [N]
+
+//Premenne urcujuce stav systemu, dolezite pre komunikaciu automatov
+int instability; //Urcuje, ci sa sklz nachadza v urovni nestability, kedy je potrebny zasah systemu ABS. Instability = 1 = nestabilita, Instability = 0 = stabilita
+int danger = 0; //Urcuje specialny stav, kedy nastalo nebezpecenstvo, vodic zareagoval, a zacina nudzove brzdenie.
+int ABS_reaction; //Urcuje, ci si situacia vyzaduje zasah systemu ABS. 1 = ANO, 0 = NIE.
+
+//Pomocne premenne
+double result;
+double chance;
+double omega;
+
+//statisticke premmenne pridane na zaver na kvantifikovanie efektivnosti brzdenia
+clock braking_time_clock; //pomocna premenna na odmeranie casu samotneho brzdenia od stlacenia pedalu po zastavenie vozidla
+double braking_time; //uchovane cislo casu v desatinach sekundy, kolko trval brzdny manever bez reakcie vodica
+double full_braking_time;  //uchovane cislo casu v desatinach sekundy, kolko trval brzdny manever vratane reakcie vodica
+double reaction_time; //uchovane cislo casu v desatinach sekundy, kolko trval reakcny cas vodica
+double former_velocity; //rychlost, pri ktorej sofer zbadal nebezpecenstvo a zacal reagovat brzdovym manevrom
+double Fb_sum; //premenna na stradanie velkosti brzdnej sily [N]
+int Fb_count; //pocet stradani velkosti brzdnej sily
+double Fb_avarage; //vypocitany priemer brzdnej sily na zaklade nastradanej velkosti a poctu stradani
+double braking_distance; //hodnota v metroch udavajuca na akej drahe vozidlo zastalo od momentu stlacenia pedalu
+double reaction_distance; //hodnota v metroch udavajuca aku drahu vozidlo preslo, kym vodic spravne zareagoval brzdenim
+double full_braking_distance; //hodnota v metroch udavajuca aku drahu vozidlo preslo od zaregistrovania nebezpecenstva po zastavenie
+
+
+//Funkcia sluzi na vypocet novej aktualnej rychlosti, pricom ju ovplyvnuju parametre minulej rychlosti v, intenzita stlacenia brzdoveho a 
+//plynoveho pedalu p_brake a p_throttle, a existencia nudzoveho brzdenia danger 
+double velocity(double v, double p_throttle, double p_brake, int danger){
+    if (danger == 1) {return v;} //Ak sme v rezime nudzoveho brzdenia, tak na vypocet rychlosti pouzivame inu funkciu
+
+    //Zistime nahodny pomer brzdy a plynu a na zaklade vysledku stanovime zrychlenie/spomalenie
+    result = p_throttle - p_brake; 
+    if(result &gt;= -100 &amp;&amp; result &lt;= -80) {a = -2.0;}
+    if(result &gt; -80 &amp;&amp; result &lt;= -50) {a = -1.5;}
+    if(result &gt; -50 &amp;&amp; result &lt;= -30) {a = -1.0;}
+    if(result &gt; -30 &amp;&amp; result &lt;= -10) {a = -0.5;}
+    if(result == 0) {a = 0.0;}
+    if(result &gt;= 10 &amp;&amp; result &lt; 30) {a = 0.5;}
+    if(result &gt;= 30 &amp;&amp; result &lt; 50) {a = 1.0;}
+    if(result &gt;= 50 &amp;&amp; result &lt; 80) {a = 1.5;}
+    if(result &gt;= 80 &amp;&amp; result &lt;= 100) {a = 2.0;}
+
+    //Kedze chceme mat na zaciatku testu brzdenia "normalnu rychlost", budeme sa ju snazit zachovat v rozumnych medziach a prioritizovat rychlosti medzi 30-135km/h
+    if(3.6*v &lt; 30) {a = 1.0;}
+    if (3.6*v &gt; 135) {a = -0.5;}
+
+    //Sofer bude mat tendenciu auto udrzovat pri predpisovych rychlostiach 50, 90, 130
+    if ((3.6*v &gt; 45 &amp;&amp; 3.6*v &lt; 55) || (3.6*v &gt; 85 &amp;&amp; 3.6*v &lt; 95) || (3.6*v &gt; 125 &amp;&amp; 3.6*v &lt; 135)){
+        chance = random(3);
+        //Vacsiu sancu samozrejme bude mat zrychlit, ako spomalit, kedze postupne nabera rychlost.
+        if(chance &lt; 2.2) {
+            if (a &gt; 0){a = 0.1;}
+            else      {a = -0.1;}
+        }
+    }
+
+
+    v = v + a/10.0; //v = v0 + a*t -- v0 mame v uz neaktualnej premennej v z predchadzajuceho kroku
+                    //Keby bola casovou jednotkou 1s, mozme si dovolit cas vynechat a vzorec mat v tvare v = v0 + a;
+                    //Kedze je cas uvadzany v desatinach sekundy, potrebujeme vynasobit zrychlenie casom 1/10s 
+                    //zrychlenie a mame vypocitane vo funkcii
+    
+    return v;
+}
+
+//Funkcia prepocitava klasicku rychlost na uhlovu, pricom berie do uvahy skutocny polomer kolesa R
+double angular_velocity(double v){
+    omega = v / R; 
+    return omega;
+}
+
+//Funckia sa stara o vypocitanie novej rychlosti, pokial nastalo nudzove brzdenie
+double braking(double v, int danger){
+    if (danger == 1) { // sme v mode nudzoveho brzdenia
+        Ov = 0.5 * ro * S * C * v * v; //spocitame odpor vzduchu
+        Fb = Fb+Ov; //pricitame odpor ku doterajsej sile trenia, tieto sily budu spolocne posobit proti smeru vozidla
+        a = Fb / m; //Vychadzame z upraveneho vztahu F = m*a, kde Fb je pre nas brzdna sila - jedina sila posobiaca proti smeru trajerktorie vozidla 
+        v = v - a/10.0; //Vychadzame zo vztahu rovnomerne spomaleneho pohybu v = v0 - a*t, funkciu vsak volame kazdu desatinu sekundy, a preto cas zastupuje zlomok 1/10.0
+        if (v &lt; 0) {v = 0;} 
+        return v;
+    }
+    //V pripade, ze nie sme v rezime nudzoveho brzdenia, prenechavame vypocet rychlosti a riadenie rychlosti vozidla na soferovi a funkcii vypocet_rychlost
+    else {
+        return v;
+    }
+}
+
+//Funkcia nastavuje pociatocnu rychlost na nulu, pripadne s istym nedeterminizmom na bud 50, 90, alebo 130 km/h.
+//V modeli s aktualnymi nastaveniami odporucam ponechat nastavenie nahodne, aby vozidlo malo pociatocnu rychlost, pretoze nudzove brzdenie prichadza relativne skoro, 
+//po 100 casovych jednotkach, teda po 10 sekundach. Za tento cas z nuly auto nezrychli v beznom behu na rozumnu rychlost a test ABS v tom pripade straca zmysel. 
+//Nulova pociatocna rychlost ma teda zmysel vtedy, ked sa oddiali nudzove brzdenie na stovky sekund (tisicky jednotiek), pretoze za takyto dlhsi cas dokaze aj sofer 
+//prirodzene v beznej premavke nabrat dostatocnu rychlost pre ucely testu brzdenia.
+double speed(){
+    if (beginning == ZERO){return 0;}
+    //Uvodna rychlost bude sancou 1/3 bud 50km/h, 90km/h alebo 130km/h, samozrejme  vsak v metroch za sekundu
+    if (beginning == RANDOM) {
+        double g = random(1); 
+        if (g &lt; 0.33) {return TOWNS_SPEED;}
+        else if (g &lt; 0.66) {return OUTSIDE_TOWNS_SPEED;}
+        else {return MOTORWAYS_SPEED;}
+    }
+    //Pre ucely viacerych testov s rovnakymi podmienkami moze byt uzitocne odstranit nedeterminizmus a nastavit vzdy rovnaku hodnotu pociatocnej rychlosti
+    else if(beginning == ASSIGNED){
+        return ASSIGNED_SPEED;
+    }
+
+    else{return 0;}
+    
+}
+
+//Funkcia vypocita sklz na zaklade hodnot rychlosti vozidla a rychlosti kolesa v uhlovej rychlosti. 
+//Pokial budu rychlosti rovnake (volne sa odvalujuce koleso pri beznej jazde), zo vzorca vyjde vysledok 0 - nulovy sklz. 
+//V pripade plneho zablokovania kolesa (omega_w = 0) bude vysledok vzorca 1 - maximalna sklz 100%.
+//Hodnota sklzu sa teda bude pohybovat v intervale [0, 1]
+double slip_computing(double omega_w, double omega_v){
+    if (omega_v &gt; 0){ 
+        if (1 - omega_w / omega_v &gt; 0){return 1 - omega_w / omega_v;}
+        else{return 0;}
+    }
+    else {
+        return 0;
+    }
+
+    
+}
+
+double angular_velocity_wheel(double v, int danger, double omega_w, int ABS_reaction){
+    //V pripade beznej jazdy bude uhlova rychlost kolesa zodpovedat prepocitanej referencnej rychlosti vozidla 
+    if (danger == 0){
+        Ww = v / R; 
+        return Ww;
+    }
+    //V pripade nudzoveho brzdenia budeme predpokladat vznik sklzu, teda vznik rozdielu referencnej rychlosti vozidla a rychlosti kolesa. 
+    //Kedze ani v realite nie je jednoduche popisat vznik sklzu, ktory zavisi na vela okolnostiach (stav vozovky, hmotnost vozidla, velkost brzdnej sily, stav pneumatik...), 
+    //budeme vychadzat z predpokladu, ze cim dlhsie posobi maximalna brzdova sila na vozidlo, tym vacsi sklz vznika. Hodnoty 1.10 a 1.2, ktorymi sa zmensuje uhlove rychlost kolesa
+    //a ktorymi vznika sklz, su zvolene empiricky, aby model posobil realisticky. 
+    //Opacnym dejom je zasah systemu ABS, ktory aj napriek stlacenemu pedalu vodica dokaze znizit brzdny tlak a odblokovat tymto sposobom koleso, cim skracuje brzdnu drahu a ponechava 
+    //vozidlo po dobu celeho manevru ovladatelnym. ABS teda pri zisteni vysokeho sklzu uvolnuje brzdny tlak, maximalne vsak natolko, ze sa sklz dostane na nulu (nemoze byt zaporny).
+    else{ 
+        Ww = omega_w; 
+        
+        //ABS zasahuje len v oblasti nestability - simulacia prace elektromagnetickeho ventila pri uvolnovani tlaku kolesa
+        if(ABS_reaction == 1){
+            if(v/R &gt; Ww/0.7){return Ww/ 0.7;}
+            else if(v/R &gt; Ww/0.8){return Ww/ 0.8;}
+            else if(v/R &gt; Ww/0.9){return Ww/ 0.9;}
+            else{return v;}
+        }
+        //Pocas brzdenia sa koleso postupne blokuje - simulacia vytvorenia sklzu
+        else{
+            chance = random(1);
+            if (chance &lt; 0.5){
+                if(v/R &lt; Ww/1.10){return v;}
+                else{return Ww/ 1.10;}
+            }
+            else {
+                if(v/R &lt; Ww/1.20){return v;}
+                else{return Ww/ 1.2;}
+            }
+        }
+    }
+        
+}
+
+//Tato funkcia poskytuje prepocet sklzu na koeficient trenia. Tento vypocet vychadza z tzv. mu-slip curve. 
+//Konkretne hodnoty su aproximovane z grafu funkcie mu-slip curve. 
+//Ako mozeme vidiet, hodnoty koeficientu trenia sa lisia na zaklade povrchu, po ktorom sa pneumatika trie. 
+//Dolezite je pamatat si, ze na efektivnejsie brzdenie potrebujeme co najvacsiu treciu silu - ta zavisi len od sily tlakovej (priamoumerna hmotnosti) a 
+//od koeficientu trenia - cim je teda vyssi, tym vozidlo efektivnejsie brzdi. Mozme teda vidiet, ze vozidlo najefektivnejsie brzdi v oblasti sklzu 0.1 - 0.3 (0.4)
+double fric_coeff_computing(double sklz, int road_condition){
+
+    if (road_condition == DRY){
+        if(sklz == 0) {return 0;}    
+        else if(sklz &gt; 0 &amp;&amp; sklz &lt; 0.1) { return 0.7;}
+        else if(sklz &gt;= 0.1 &amp;&amp; sklz &lt; 0.2) {return 1.0;}
+        else if(sklz &gt;= 0.2 &amp;&amp; sklz &lt; 0.3) {return 0.85;}
+        else if(sklz &gt;= 0.3 &amp;&amp; sklz &lt; 0.4) {return 0.8;}
+        else if(sklz &gt;= 0.4 &amp;&amp; sklz &lt;= 0.5) {return 0.75;}
+        else if(sklz &gt;= 0.5 &amp;&amp; sklz &lt;= 0.6) {return 0.73;}
+        else if(sklz &gt;= 0.6 &amp;&amp; sklz &lt;= 0.7) {return 0.71;}
+        else if(sklz &gt;= 0.7 &amp;&amp; sklz &lt;= 0.8) {return 0.69;}
+        else if(sklz &gt;= 0.8 &amp;&amp; sklz &lt;= 0.9) {return 0.67;}
+        else {return 0.66;}
+    }
+    else if(road_condition == SNOWY){
+        if(sklz == 0) {return 0;}    
+        else if(sklz &gt; 0 &amp;&amp; sklz &lt; 0.1) { return 0.25;}
+        else if(sklz &gt;= 0.1 &amp;&amp; sklz &lt; 0.2) {return 0.4;}
+        else if(sklz &gt;= 0.2 &amp;&amp; sklz &lt; 0.3) {return 0.37;}
+        else if(sklz &gt;= 0.3 &amp;&amp; sklz &lt; 0.4) {return 0.35;}
+        else if(sklz &gt;= 0.4 &amp;&amp; sklz &lt;= 0.5) {return 0.33;}
+        else if(sklz &gt;= 0.5 &amp;&amp; sklz &lt;= 0.6) {return 0.32;}
+        else if(sklz &gt;= 0.6 &amp;&amp; sklz &lt;= 0.7) {return 0.30;}
+        else if(sklz &gt;= 0.7 &amp;&amp; sklz &lt;= 0.8) {return 0.29;}
+        else if(sklz &gt;= 0.8 &amp;&amp; sklz &lt;= 0.9) {return 0.28;}
+        else {return 0.26;}
+    }
+
+    else{return 0;}
+}
+
+//Vypocet celkovej brzdnej sily bude zodpovedat trecej sile, ktora je sucinom koeficientu trenia a tlakovej sily.
+//Pre ucely neskorsieho vypoctu brzdnej drahy potrebujeme ziskat priemernu hodnotu brzdnej sily pri nudzovom brzdeni, preto si tieto hodnoty uchovavame
+//Neskor vypocet drahy vychadza zo vzorca s = v0^2 * m / 2F, pricom F bude pre nas predstavovat len brzdnu silu vyvolanu trenim
+double braking_force(double friction_coeff, double Fn){
+    if(friction_coeff * Fn &gt; 0){
+        Fb_sum = Fb_sum + friction_coeff * Fn;
+        Fb_count += 1;
+    }    
+    return friction_coeff * Fn;
+}
+</declaration>
+	<template>
+		<name x="5" y="5">Engine</name>
+		<declaration>// Place local declarations here.</declaration>
+		<location id="id0" x="-552" y="-280">
+			<name x="-562" y="-314">on</name>
+		</location>
+		<location id="id1" x="-739" y="-187">
+			<name x="-748" y="-221">off</name>
+		</location>
+		<init ref="id1"/>
+		<transition>
+			<source ref="id0"/>
+			<target ref="id1"/>
+			<label kind="synchronisation" x="-637" y="-187">engine_stop?</label>
+			<nail x="-552" y="-187"/>
+		</transition>
+		<transition>
+			<source ref="id1"/>
+			<target ref="id0"/>
+			<label kind="synchronisation" x="-714" y="-263">engine_start?</label>
+		</transition>
+	</template>
+	<template>
+		<name>ControlUnit</name>
+		<location id="id2" x="-1674" y="-714">
+			<name x="-1657" y="-731">check_speed2</name>
+			<urgent/>
+		</location>
+		<location id="id3" x="-1683" y="-527">
+			<name x="-1709" y="-501">check_speed</name>
+			<urgent/>
+		</location>
+		<location id="id4" x="-2082" y="-476">
+			<name x="-2125" y="-459">stop_received</name>
+			<committed/>
+		</location>
+		<location id="id5" x="-1895" y="-518">
+			<name x="-1929" y="-484">engine_running</name>
+			<label kind="invariant" x="-1912" y="-501">y &lt;= 1</label>
+		</location>
+		<location id="id6" x="-2082" y="-552">
+			<name x="-2124" y="-594">start_received</name>
+			<committed/>
+		</location>
+		<location id="id7" x="-2269" y="-527">
+			<name x="-2286" y="-510">waiting</name>
+		</location>
+		<init ref="id7"/>
+		<transition>
+			<source ref="id2"/>
+			<target ref="id5"/>
+			<label kind="assignment" x="-1938" y="-688">p_throttle = 0, 
+p_brake = 0,
+v :=braking(v, danger)</label>
+		</transition>
+		<transition>
+			<source ref="id3"/>
+			<target ref="id2"/>
+			<label kind="assignment" x="-1666" y="-663">y:=0,
+v := velocity(v, p_throttle, p_brake, danger), 
+omega_v = angular_velocity(v)</label>
+		</transition>
+		<transition>
+			<source ref="id5"/>
+			<target ref="id3"/>
+			<label kind="guard" x="-1793" y="-518">y == 1</label>
+		</transition>
+		<transition>
+			<source ref="id4"/>
+			<target ref="id7"/>
+			<label kind="synchronisation" x="-2218" y="-484">engine_stop!</label>
+		</transition>
+		<transition>
+			<source ref="id5"/>
+			<target ref="id4"/>
+			<label kind="synchronisation" x="-1997" y="-493">stop?</label>
+		</transition>
+		<transition>
+			<source ref="id6"/>
+			<target ref="id5"/>
+			<label kind="synchronisation" x="-2014" y="-603">engine_start!</label>
+			<label kind="assignment" x="-1997" y="-586">y:=0, 
+v = speed()</label>
+		</transition>
+		<transition>
+			<source ref="id7"/>
+			<target ref="id6"/>
+			<label kind="synchronisation" x="-2193" y="-578">start?</label>
+		</transition>
+	</template>
+	<template>
+		<name>Driver</name>
+		<location id="id8" x="-68" y="-484">
+			<name x="-103" y="-459">test_completed</name>
+		</location>
+		<location id="id9" x="-518" y="-484">
+			<name x="-561" y="-467">heavy_braking</name>
+			<label kind="exponentialrate" x="-527" y="-518">1</label>
+		</location>
+		<location id="id10" x="-518" y="-331">
+			<name x="-569" y="-314">obstacle_reaction</name>
+			<label kind="invariant" x="-560" y="-297">reaction &lt;= 12</label>
+		</location>
+		<location id="id11" x="-884" y="-195">
+			<name x="-918" y="-238">pedal_braking</name>
+			<label kind="invariant" x="-969" y="-263">t &lt;= 1 &amp;&amp; p_brake &lt;= MAX_BRAKE</label>
+		</location>
+		<location id="id12" x="-901" y="-399">
+			<name x="-926" y="-382">pedal_accelerator</name>
+			<label kind="invariant" x="-952" y="-357">t &lt;= 1 &amp;&amp; p_throttle &lt;= MAX_THROTTLE</label>
+		</location>
+		<location id="id13" x="-1241" y="-289">
+			<name x="-1224" y="-323">ready</name>
+			<urgent/>
+		</location>
+		<location id="id14" x="-1419" y="-289">
+			<name x="-1444" y="-264">default</name>
+			<label kind="exponentialrate" x="-1427" y="-246">5</label>
+		</location>
+		<branchpoint id="id15" x="-1079" y="-289">
+		</branchpoint>
+		<init ref="id14"/>
+		<transition>
+			<source ref="id9"/>
+			<target ref="id8"/>
+			<label kind="guard" x="-493" y="-620">v == 0</label>
+			<label kind="assignment" x="-493" y="-603">full_braking_time = braking_time_clock, 
+braking_time = full_braking_time - reaction_time,
+Fb_avarage = Fb_sum / Fb_count, 
+braking_distance = 0.5 * former_velocity * former_velocity * m / Fb_avarage, 
+reaction_distance = former_velocity * reaction_time/10.0, 
+full_braking_distance = reaction_distance + braking_distance</label>
+		</transition>
+		<transition>
+			<source ref="id10"/>
+			<target ref="id9"/>
+			<label kind="guard" x="-501" y="-442">reaction &gt;= 8</label>
+			<label kind="assignment" x="-501" y="-425">danger := 1, 
+reaction_time := reaction, 
+former_velocity := v</label>
+		</transition>
+		<transition>
+			<source ref="id11"/>
+			<target ref="id10"/>
+			<label kind="guard" x="-714" y="-255">reaction &gt;= 0</label>
+			<label kind="synchronisation" x="-714" y="-238">obstacle?</label>
+			<label kind="assignment" x="-714" y="-221">reaction := 0, 
+braking_time_clock := 0</label>
+		</transition>
+		<transition>
+			<source ref="id12"/>
+			<target ref="id10"/>
+			<label kind="guard" x="-722" y="-450">reaction &gt;= 0</label>
+			<label kind="synchronisation" x="-722" y="-433">obstacle?</label>
+			<label kind="assignment" x="-722" y="-416">reaction := 0, 
+braking_time_clock := 0</label>
+		</transition>
+		<transition>
+			<source ref="id11"/>
+			<target ref="id11"/>
+			<label kind="guard" x="-960" y="-85">p_brake + 10 &lt;= MAX_BRAKE</label>
+			<label kind="assignment" x="-926" y="-68">p_brake = p_brake + 10</label>
+			<nail x="-765" y="-102"/>
+			<nail x="-969" y="-93"/>
+		</transition>
+		<transition>
+			<source ref="id12"/>
+			<target ref="id12"/>
+			<label kind="guard" x="-977" y="-526">p_throttle +10 &lt;= MAX_THROTTLE</label>
+			<label kind="assignment" x="-986" y="-484">p_throttle = p_throttle + 10</label>
+			<nail x="-1028" y="-450"/>
+			<nail x="-790" y="-450"/>
+		</transition>
+		<transition>
+			<source ref="id11"/>
+			<target ref="id13"/>
+			<label kind="guard" x="-1088" y="-161">t == 1</label>
+			<nail x="-1190" y="-144"/>
+		</transition>
+		<transition>
+			<source ref="id12"/>
+			<target ref="id13"/>
+			<label kind="guard" x="-1096" y="-425">t == 1</label>
+			<nail x="-1198" y="-399"/>
+		</transition>
+		<transition>
+			<source ref="id15"/>
+			<target ref="id11"/>
+			<label kind="probability" x="-1028" y="-238">50</label>
+		</transition>
+		<transition>
+			<source ref="id15"/>
+			<target ref="id12"/>
+			<label kind="probability" x="-1020" y="-348">50</label>
+		</transition>
+		<transition>
+			<source ref="id13"/>
+			<target ref="id15"/>
+			<label kind="assignment" x="-1147" y="-280">t:=0</label>
+		</transition>
+		<transition>
+			<source ref="id13"/>
+			<target ref="id14"/>
+			<label kind="guard" x="-1326" y="-187">v == 0</label>
+			<label kind="synchronisation" x="-1326" y="-204">stop!</label>
+			<nail x="-1309" y="-204"/>
+		</transition>
+		<transition>
+			<source ref="id14"/>
+			<target ref="id13"/>
+			<label kind="synchronisation" x="-1317" y="-314">start!</label>
+			<label kind="assignment" x="-1368" y="-314">x:=0</label>
+		</transition>
+	</template>
+	<template>
+		<name>ObstacleSpotted</name>
+		<location id="id16" x="-527" y="-77">
+			<label kind="invariant" x="-620" y="-60">x &lt;= OBSTACLE_TIME_MAX</label>
+		</location>
+		<init ref="id16"/>
+		<transition>
+			<source ref="id16"/>
+			<target ref="id16"/>
+			<label kind="guard" x="-782" y="-111">x &gt; OBSTACLE_TIME_MIN</label>
+			<label kind="synchronisation" x="-569" y="-170">obstacle!</label>
+			<label kind="assignment" x="-433" y="-111">x:= 0</label>
+			<nail x="-671" y="-136"/>
+			<nail x="-400" y="-136"/>
+		</transition>
+	</template>
+	<template>
+		<name>Wheel</name>
+		<location id="id17" x="-442" y="-255">
+			<name x="-493" y="-289">counting_information</name>
+			<urgent/>
+		</location>
+		<location id="id18" x="-442" y="-144">
+			<name x="-433" y="-136">running</name>
+			<label kind="invariant" x="-459" y="-119">y &lt;= 1</label>
+		</location>
+		<location id="id19" x="-722" y="-144">
+			<name x="-732" y="-178">stopped</name>
+		</location>
+		<init ref="id19"/>
+		<transition>
+			<source ref="id17"/>
+			<target ref="id18"/>
+			<label kind="assignment" x="-297" y="-238">omega_w = angular_velocity_wheel(v, danger, omega_w, ABS_reaction), 
+slip = slip_computing(omega_w, omega_v), 
+friction_coeff = fric_coeff_computing(slip, road_condition),
+Fb = braking_force(friction_coeff, Fn),
+y:=0</label>
+			<nail x="-314" y="-255"/>
+			<nail x="-314" y="-144"/>
+		</transition>
+		<transition>
+			<source ref="id18"/>
+			<target ref="id17"/>
+			<label kind="guard" x="-484" y="-212">y == 1</label>
+		</transition>
+		<transition>
+			<source ref="id18"/>
+			<target ref="id19"/>
+			<label kind="guard" x="-603" y="-59">v == 0</label>
+			<label kind="synchronisation" x="-629" y="-42">engine_stop?</label>
+			<nail x="-586" y="-68"/>
+		</transition>
+		<transition>
+			<source ref="id19"/>
+			<target ref="id18"/>
+			<label kind="synchronisation" x="-637" y="-170">engine_start?</label>
+		</transition>
+	</template>
+	<template>
+		<name>Slip</name>
+		<location id="id20" x="-102" y="0">
+			<name x="-119" y="17">unstable</name>
+			<urgent/>
+		</location>
+		<location id="id21" x="-255" y="-263">
+			<name x="-265" y="-297">stable</name>
+			<urgent/>
+		</location>
+		<location id="id22" x="-119" y="-144">
+			<name x="-93" y="-161">deciding_stability</name>
+			<urgent/>
+		</location>
+		<location id="id23" x="-270" y="-42">
+			<name x="-297" y="-8">car_running</name>
+			<label kind="invariant" x="-280" y="-25">y &lt;= 1</label>
+		</location>
+		<location id="id24" x="-561" y="-34">
+			<name x="-571" y="-68">start_state</name>
+		</location>
+		<init ref="id24"/>
+		<transition>
+			<source ref="id20"/>
+			<target ref="id23"/>
+		</transition>
+		<transition>
+			<source ref="id22"/>
+			<target ref="id20"/>
+			<label kind="guard" x="-93" y="-102">slip &gt;= 0.2</label>
+			<label kind="assignment" x="-93" y="-85">instability = 1</label>
+		</transition>
+		<transition>
+			<source ref="id21"/>
+			<target ref="id23"/>
+			<nail x="-263" y="-144"/>
+		</transition>
+		<transition>
+			<source ref="id22"/>
+			<target ref="id21"/>
+			<label kind="guard" x="-195" y="-246">slip &lt; 0.2</label>
+			<label kind="assignment" x="-195" y="-229">instability := 0</label>
+		</transition>
+		<transition>
+			<source ref="id23"/>
+			<target ref="id22"/>
+			<label kind="guard" x="-221" y="-119">y == 1</label>
+		</transition>
+		<transition>
+			<source ref="id23"/>
+			<target ref="id24"/>
+			<label kind="synchronisation" x="-450" y="25">engine_stop?</label>
+			<nail x="-408" y="25"/>
+		</transition>
+		<transition>
+			<source ref="id24"/>
+			<target ref="id23"/>
+			<label kind="synchronisation" x="-467" y="-93">engine_start?</label>
+			<label kind="assignment" x="-467" y="-68">instability = 0</label>
+		</transition>
+	</template>
+	<template>
+		<name>ABS</name>
+		<location id="id25" x="-2490" y="-357">
+			<name x="-2558" y="-391">ABS_intervention_needed</name>
+			<urgent/>
+		</location>
+		<location id="id26" x="-2490" y="-59">
+			<name x="-2533" y="-42">no_work_needed</name>
+			<urgent/>
+		</location>
+		<location id="id27" x="-2490" y="-195">
+			<name x="-2473" y="-204">deciding_reaction</name>
+			<urgent/>
+		</location>
+		<location id="id28" x="-2694" y="-195">
+			<name x="-2728" y="-178">ABS_on</name>
+			<label kind="invariant" x="-2720" y="-161">y &lt;= 1</label>
+		</location>
+		<location id="id29" x="-2932" y="-195">
+			<name x="-2949" y="-178">ABS_off</name>
+		</location>
+		<init ref="id29"/>
+		<transition>
+			<source ref="id25"/>
+			<target ref="id28"/>
+			<label kind="assignment" x="-2694" y="-314">ABS_reaction = 1</label>
+		</transition>
+		<transition>
+			<source ref="id26"/>
+			<target ref="id28"/>
+			<label kind="assignment" x="-2686" y="-110">ABS_reaction = 0</label>
+		</transition>
+		<transition>
+			<source ref="id27"/>
+			<target ref="id26"/>
+			<label kind="guard" x="-2473" y="-136">instability == 0</label>
+		</transition>
+		<transition>
+			<source ref="id27"/>
+			<target ref="id25"/>
+			<label kind="guard" x="-2473" y="-289">instability == 1</label>
+		</transition>
+		<transition>
+			<source ref="id28"/>
+			<target ref="id27"/>
+			<label kind="guard" x="-2575" y="-229">y == 1</label>
+		</transition>
+		<transition>
+			<source ref="id29"/>
+			<target ref="id28"/>
+			<label kind="guard" x="-2890" y="-246">ABS_allowed == true</label>
+			<label kind="synchronisation" x="-2890" y="-229">engine_start?</label>
+		</transition>
+	</template>
+	<system>// Place template instantiations here.
+//Systemove deklaracie, zahrnutie konkretnych automatov do simulacie, ich pomenovanie, inicializacia
+engine1 = Engine();
+driver1 = Driver();
+controlunit1 = ControlUnit();
+wheel1 = Wheel();
+brakesignal1 = ObstacleSpotted();
+slip1 = Slip();
+abs1 = ABS();
+// List one or more processes to be composed into a system.
+system engine1, driver1, controlunit1, wheel1, brakesignal1, slip1, abs1;
+    </system>
+	<queries>
+		<query>
+			<formula>Pr [&lt;=100](&lt;&gt; t &gt; 90 and full_braking_distance &lt; 85)
+			</formula>
+			<comment>Test pravdepodobnosti, že vozidlo zastane do určitého počtu metrov.
+			</comment>
+		</query>
+		<query>
+			<formula>simulate 10 [&lt;= 200] {3.6*v, full_braking_distance, braking_distance}
+			</formula>
+			<comment>Test variability 10tich behov simulácie.
+			</comment>
+		</query>
+		<query>
+			<formula>simulate 1 [&lt;= 220] {ABS_reaction, instability, slip, Fb/1000, Fb_avarage/1000, friction_coeff, 3.6*v, v, braking_distance, reaction_distance, full_braking_distance, omega_v, omega_w, a, former_velocity, 3.6*former_velocity, braking_time, reaction_time, full_braking_time, Ov/10.0}
+			</formula>
+			<comment>Simulácia behu pre všetky potrebné premenné. Premenné je možné zobraziť a skryť v Tools -&gt; Plot Composer
+			</comment>
+		</query>
+		<query>
+			<formula>simulate 1 [&lt;= 220] {ABS_reaction}
+			</formula>
+			<comment>Umoznuje sledovat kedy zasahuje ABS.
+			</comment>
+		</query>
+		<query>
+			<formula>simulate 1 [&lt;= 220] {instability, slip}
+			</formula>
+			<comment>Pomaha sledovat priebeh sklzu a vstup do oblasti nestability.
+			</comment>
+		</query>
+		<query>
+			<formula>simulate 1 [&lt;= 220] {Fb_avarage/1000, Fb/1000}
+			</formula>
+			<comment>Uvadza brzdnu silu posobiacu na vozidlo v jednotke kN. Po ukonceni brzdenia je vypocitana priemerna brzdna sila Fb_avarage.
+			</comment>
+		</query>
+		<query>
+			<formula>simulate 1 [&lt;= 220] {Fb/1000}
+			</formula>
+			<comment>Simulacia brzdnej sily posobiacej na koleso v jednotke kN.
+			</comment>
+		</query>
+		<query>
+			<formula>simulate 1 [&lt;= 220] {friction_coeff}
+			</formula>
+			<comment>Simulacia skuma priebeh koeficientu trenia.
+			</comment>
+		</query>
+		<query>
+			<formula>simulate 1 [&lt;= 220] {slip}
+			</formula>
+			<comment>Simulacia skuma priebeh sklzu.
+			</comment>
+		</query>
+		<query>
+			<formula>simulate 1 [&lt;= 220] {3.6*v}
+			</formula>
+			<comment>Simulacia skuma priebeh rychlosti v jednotke km/h
+			</comment>
+		</query>
+		<query>
+			<formula>simulate 1 [&lt;= 220] {3.6*v, braking_distance, reaction_distance, full_braking_distance}
+			</formula>
+			<comment>SImulacia predstavuje priebeh rychlosti v km/h a ako dlho v desatinach sekundy trvalo samotne brzdenie, reakcia na prekazku, brzdenie spolocne s reakciou.
+			</comment>
+		</query>
+		<query>
+			<formula>simulate 1 [&lt;= 220] {3.6*v, omega_v, omega_w}
+			</formula>
+			<comment>Skuma zavislost uhlovej rychlosti vozidla a uhlovej rychlosti kolesa. Pomer tychto velicin vytvara sklz. Rychlost v v kilometroch za hodinu dotvara obraz, co sa v modeli deje.
+			</comment>
+		</query>
+		<query>
+			<formula>simulate 1 [&lt;= 220] {a}
+			</formula>
+			<comment>Priebeh zrychlenia(spomalenia) v m/s^2. Dolezite je poznamenat, ze v case beznej prevadzky sa vychadza zo vzorca v = v0 + a*t, teda zrychlenie a je v zavislosti na pridavani ci brzdeni kladne alebo zaporne. V pripade nudzoveho brzdenia sa vychadza zo vzorca v = v0 - a*t, kde a nadobuda kladne hodnoty, aj ked sa jedna o spomalenie.
+			</comment>
+		</query>
+		<query>
+			<formula>simulate 1 [&lt;=220] {v, former_velocity}
+			</formula>
+			<comment>Test zaznamenania rychlosti, kedy zacala reakcia vodica a brzdny manever.
+			</comment>
+		</query>
+		<query>
+			<formula>simulate 1 [&lt;= 300] {reaction, reaction_time}
+			</formula>
+			<comment>Graf, z ktoreho dokazeme v pripade casovej veliciny "reakcia" vycitat, kedy prislo k udalosti nebezpecenstva, a pomocou reaction_time si zaznamenavame ako dlho reakcia vodicovi trvala, oboje v desatinach sekundy.
+			</comment>
+		</query>
+		<query>
+			<formula>simulate 1 [&lt;= 220] {3.6*v, braking_time, full_braking_time}
+			</formula>
+			<comment>Hodiny braking_time sa resetuju ked dochadza k vyskytu udalosti nebezpecenstva, jednotka time_measured zaznamenava cas v desatinach sekundy, kolko trvalo autu zastavit.
+			</comment>
+		</query>
+	</queries>
+</nta>
